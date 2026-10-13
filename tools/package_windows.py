@@ -43,6 +43,12 @@ def main():
     shutil.copytree(ROOT / "web", stage / "web")
     with zipfile.ZipFile(python_zip()) as archive:
         archive.extractall(stage / "python", [n for n in archive.namelist() if n not in UNUSED])
+    # the standard library ships as a zip inside the embeddable package; unpacked into Lib the folder holds no zip
+    tag = "python%s%s" % tuple(PYTHON[0].split(".")[:2])
+    with zipfile.ZipFile(stage / "python" / (tag + ".zip")) as library:
+        library.extractall(stage / "python" / "Lib")
+    (stage / "python" / (tag + ".zip")).unlink()
+    (stage / "python" / (tag + "._pth")).write_text("Lib\n.\n", encoding="ascii")
     for name in ("LICENSE", "THIRD_PARTY.md", "README.md"):
         shutil.copy2(ROOT / name, stage / name)
     # the packed relay must start with the packed Python before it is shipped
