@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex">
+  <meta name="theme-color" content="#fbfbfc">
+  <meta name="description" content="在手机上使用电脑里的终端、Claude Code 和 Codex。">
+  <title>Phone Remote CLI</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="app.css">
+  <script defer src="terminal/skins.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <main id="login" hidden>
+    <form id="login-form" autocomplete="on">
+      <div class="mark" aria-hidden="true"></div>
+      <h1>Phone Remote CLI</h1>
+      <p>输入电脑端窗口里显示的访问密码。</p>
+      <label for="password">访问密码</label>
+      <input id="password" type="password" autocomplete="current-password" required>
+      <button type="submit" class="solid">进入</button>
+      <p id="login-error" role="alert"></p>
+    </form>
+  </main>
+
+  <main id="home" hidden>
+    <header class="top">
+      <button type="button" class="icon" id="back" aria-label="返回全部项目" hidden></button>
+      <div class="who">
+        <h1 id="heading">Phone Remote CLI</h1>
+        <p id="device" role="status" aria-live="polite"><span id="dot" aria-hidden="true"></span><span id="device-text">正在连接…</span></p>
+      </div>
+      <button type="button" class="icon" id="look" aria-label="外观"></button>
+      <button type="button" class="icon" id="more" aria-label="更多"></button>
+    </header>
+
+    <div id="loading" aria-hidden="true"><i></i><i></i><i></i></div>
+    <section id="offline" class="notice" hidden></section>
+
+    <!-- every project at a glance -->
+    <div id="overview" hidden>
+      <section id="active" hidden>
+        <div class="section-head"><h2>进行中</h2><p id="active-summary"></p></div>
+        <ul class="cards" id="active-list"></ul>
+      </section>
+      <details id="background" class="held-sessions" hidden>
+        <summary><b>被电脑上其它程序占用的对话</b><span id="background-summary"></span></summary>
+        <ul class="cards" id="background-list"></ul>
+      </details>
+      <section>
+        <div class="section-head"><h2>项目</h2><p id="project-summary"></p></div>
+        <ul class="cards" id="project-list"></ul>
+      </section>
+    </div>
+
+    <!-- one project -->
+    <div id="project" hidden>
+      <button type="button" id="project-files" aria-label="浏览这个项目的文件"><span class="tool folder" id="project-files-icon"></span><span class="text"><b>文件</b><span id="project-path"></span></span><span class="chev" id="project-files-chev"></span></button>
+      <div id="launch" aria-label="新建终端"></div>
+      <section id="p-active" hidden><div class="section-head"><h2>进行中</h2></div><ul class="cards"></ul></section>
+      <section id="p-live" hidden><div class="section-head"><h2>电脑上打开着</h2><p>先查看内容，再决定是否在手机上继续</p></div><ul class="cards"></ul></section>
+      <details id="p-background" class="held-sessions" hidden><summary><b>被电脑上其它程序占用的对话</b><span id="p-background-summary"></span></summary><ul class="cards"></ul></details>
+      <section id="p-history" hidden>
+        <div class="section-head"><h2>历史对话</h2><p id="history-count"></p></div>
+        <input id="search" type="search" placeholder="搜索对话标题" aria-label="搜索历史对话" hidden>
+        <ul class="cards"></ul>
+        <button type="button" id="more-history" class="quiet wide" hidden>显示更多</button>
+      </section>
+      <section id="p-ended" hidden><div class="section-head"><h2>历史终端</h2></div><ul class="cards"></ul><button type="button" id="more-ended" class="quiet wide" hidden>显示更多终端</button></section>
+      <p id="empty" hidden>这个项目还没有对话。用上面的按钮新建一个终端。</p>
+    </div>
+  </main>
+
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+  <dialog id="sheet"><form method="dialog" id="sheet-form"></form></dialog>
+</body>
+</html>

@@ -1,0 +1,16 @@
+/* The program on the computer, seen from the phone: a few of its settings. The list uses the cards of the other
+   pages (../app.css). */
+.note { color: var(--muted); font-size: .86rem; text-align: center; margin: 18px 8px; }
+
+/* ---- settings: what it is on the left, the choice on the right; a choice of three goes below on a narrow screen */
+#settings .card { align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 12px 14px; }
+#settings .text { flex: 1 1 12rem; }
+#settings .text span { color: var(--muted); font-size: .8rem; line-height: 1.4; }
+.pick { display: flex; flex: none; padding: 3px; gap: 2px; border-radius: 12px; border: 1px solid var(--line); background: var(--bg); }
+.pick button { min-height: 36px; padding: 0 12px; border-radius: 9px; color: var(--muted); font-size: .88rem; white-space: nowrap; }
+.pick button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+.flip { flex: none; position: relative; width: 52px; height: 30px; border-radius: 15px; border: 1px solid var(--line); background: var(--raised); transition: background .15s; }
+.flip::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: var(--muted); transition: transform .15s, background .15s; }
+.flip[aria-checked="true"] { background: var(--accent); border-color: var(--accent); }
+.flip[aria-checked="true"]::after { transform: translateX(22px); background: var(--on-accent); }
+@media (prefers-reduced-motion: reduce) { .flip, .flip::after { transition: none; } }

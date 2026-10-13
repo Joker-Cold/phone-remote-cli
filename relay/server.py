@@ -1,0 +1,511 @@
+"""remote-cli relay: one small HTTP server between the phone and the computer.
+
+    python server.py --host 127.0.0.1 --port 8722 --data ./data
+
+It serves the web client, checks the password, and passes terminal input and output along. It never runs
+anything itself: the program on the computer does. Standard library only.
+
+The program on the computer starts it on the computer's Tailscale address, so that it is reached through
+Tailscale's encrypted tunnel only.
+"""
+import argparse
+import gzip
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import socket
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # an embedded Python does not add the script's folder
+import relay  # noqa: E402
+import websocket  # noqa: E402
+
+VERSION = "1.0.6"
+SESSION_DAYS = 90
+LOGIN_TRIES, LOGIN_LOCK, LOGIN_TRIES_ALL = 6, 900, 40
+BODY_LIMIT = 4 * 1024 * 1024
+TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+         ".woff2": "font/woff2", ".bcmap": "application/octet-stream", ".json": "application/json; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
+         ".ico": "image/x-icon", ".webmanifest": "application/manifest+json"}
+SECURITY = {"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
+            "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+                                       "media-src 'self' blob:; worker-src 'self' blob:; "
+                                       "font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"}
+
+
+# The pages are the same files until the program on the computer is updated. A phone keeps them and asks only
+# whether they have changed, and text is sent compressed: opening a terminal no longer fetches the terminal's
+# program again, which through a Tailscale relay took longer than everything else on the page.
+PACKED = (".html", ".js", ".css", ".json", ".svg", ".webmanifest")
+_pages = {}         # file -> ((time changed, size), tag, content, compressed content or None)
+_pages_lock = threading.Lock()
+
+
+def _page(full):
+    stat = os.stat(full)
+    mark = (stat.st_mtime_ns, stat.st_size)
+    with _pages_lock:
+        kept = _pages.get(full)
+    if not kept or kept[0] != mark:
+        with open(full, "rb") as stream:
+            data = stream.read()
+        packed = gzip.compress(data, 6, mtime=0) if full.lower().endswith(PACKED) and len(data) > 1024 else None
+        kept = (mark, hashlib.sha256(data).hexdigest()[:24], data, packed)
+        with _pages_lock:
+            _pages[full] = kept
+    return kept
+
+
+# A page names its own files with a mark of what they hold ("app.js?v=3f9a..."). A file asked for by its mark never
+# changes, so the phone keeps it for good and opens the page again without asking about each of its files; a file
+# that did change has a new mark in the next page.
+_LINK = re.compile(r'((?:src|href)="|url\(")([^"?#:]+\.(?:js|css|woff2|png|svg|ico|webmanifest))(")')
+
+
+def _marked(full, root):
+    """An HTML page with the marks of its files: its tag, its content, and its content compressed."""
+    folder = os.path.dirname(full)
+
+    def mark(found):
+        target = os.path.normpath(os.path.join(folder, *found.group(2).split("/")))
+        if not target.startswith(root + os.sep) or not os.path.isfile(target):
+            return found.group(0)
+        return "%s%s?v=%s%s" % (found.group(1), found.group(2), _page(target)[1][:12], found.group(3))
+
+    body = _LINK.sub(mark, _page(full)[2].decode("utf-8")).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()[:24], body, gzip.compress(body, 6, mtime=0)
+
+
+class Sessions:
+    """Sign-ins that survive a restart. Only a hash of each token is kept."""
+
+    def __init__(self, path):
+        self.path, self.lock = path, threading.Lock()
+        try:
+            with open(path, encoding="utf-8") as stream:
+                self.items = {k: float(v) for k, v in json.load(stream).items()}
+        except (OSError, ValueError, AttributeError):
+            self.items = {}
+
+    def _save(self):
+        tmp = self.path + ".tmp"
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as stream:
+            json.dump(self.items, stream)
+        os.replace(tmp, self.path)
+
+    def create(self):
+        token = secrets.token_hex(32)
+        with self.lock:
+            now = time.time()
+            self.items = {k: v for k, v in self.items.items() if v > now}
+            self.items[hashlib.sha256(token.encode()).hexdigest()] = now + SESSION_DAYS * 86400
+            self._save()
+        return token
+
+    def valid(self, token):
+        if not token or len(token) != 64:
+            return False
+        key = hashlib.sha256(token.encode()).hexdigest()
+        with self.lock:
+            expires = self.items.get(key, 0)
+            now = time.time()
+            if expires <= now:
+                return False
+            if expires - now < (SESSION_DAYS - 1) * 86400:      # used: good for another full period
+                self.items[key] = now + SESSION_DAYS * 86400
+                self._save()
+            return True
+
+    def remove(self, token):
+        with self.lock:
+            if self.items.pop(hashlib.sha256((token or "").encode()).hexdigest(), None) is not None:
+                self._save()
+
+
+class Attempts:
+    """Wrong passwords: a limit per address and one for all addresses together."""
+
+    def __init__(self):
+        self.lock, self.failed = threading.Lock(), {}
+
+    def _recent(self, key, now):
+        self.failed[key] = [t for t in self.failed.get(key, []) if now - t < LOGIN_LOCK]
+        return self.failed[key]
+
+    def blocked(self, address):
+        with self.lock:
+            now = time.time()
+            return len(self._recent(address, now)) >= LOGIN_TRIES or len(self._recent("*", now)) >= LOGIN_TRIES_ALL
+
+    def fail(self, address):
+        with self.lock:
+            now = time.time()
+            self._recent(address, now).append(now)
+            self._recent("*", now).append(now)
+            for key in [k for k, v in self.failed.items() if not v]:
+                del self.failed[key]
+
+    def clear(self, address):
+        with self.lock:
+            self.failed.pop(address, None)
+
+
+def read_password(data):
+    """The password from RCLI_PASSWORD, else from <data>/password.txt; one is made on first start."""
+    given = os.environ.get("RCLI_PASSWORD", "").strip()
+    path = os.path.join(data, "password.txt")
+    if given:
+        return given, False
+    try:
+        with open(path, encoding="utf-8") as stream:
+            saved = stream.read().strip()
+        if saved:
+            return saved, False
+    except OSError:
+        pass
+    made = "-".join(secrets.token_hex(3) for _ in range(4))
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as stream:
+        stream.write(made + "\n")
+    return made, True
+
+
+class Tickets:
+    """Sign-ins handed out to someone who is signed in already, each good once and for a minute. The program on
+    the computer uses one to open its own pages in a browser window without the password ever being in an address."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.until = {}
+
+    def make(self):
+        ticket = secrets.token_urlsafe(24)
+        with self.lock:
+            now = time.time()
+            for old in [key for key, end in self.until.items() if end < now]:
+                del self.until[old]
+            if len(self.until) > 200:
+                self.until.clear()
+            self.until[hashlib.sha256(ticket.encode("utf-8")).hexdigest()] = now + 60
+        return ticket
+
+    def take(self, ticket):
+        if not isinstance(ticket, str) or not ticket:
+            return False
+        with self.lock:
+            end = self.until.pop(hashlib.sha256(ticket.encode("utf-8")).hexdigest(), 0)
+        return end >= time.time()
+
+
+class Space:
+    """What one computer and its phones share: a password, the sign-ins, and the terminals (a relay.Relay)."""
+
+    def __init__(self, folder, password):
+        os.makedirs(folder, exist_ok=True)
+        self.folder, self.password = folder, password
+        self.sessions = Sessions(os.path.join(folder, "sessions.json"))
+        self.attempts, self.tickets = Attempts(), Tickets()
+        self.store = os.path.join(folder, "terminals.json")
+        self.relay = relay.Relay(self.store)
+
+    def accepts(self, given):
+        if not isinstance(given, str):
+            return False
+        return hmac.compare_digest(given.encode("utf-8"), self.password.encode("utf-8"))
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "remote-cli"       # the version is told to who asks for it, not in every answer
+    sys_version = ""
+
+    def setup(self):
+        super().setup()
+        # Headers and small terminal updates must not wait for a delayed TCP acknowledgment.
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionError, TimeoutError):
+            pass  # readers can cancel a held request when the app goes into the background
+
+    def log_message(self, *args):       # terminal input and output must never reach a log
+        pass
+
+    # ---- helpers
+    def _address(self):
+        return self.client_address[0]       # nothing stands in front of this relay that could name another address
+
+    def _token(self):
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Bearer "):
+            return header[7:].strip()
+        for part in self.headers.get("Cookie", "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == "rcli":
+                return value
+        return ""
+
+    def _authed(self):
+        return self.space.sessions.valid(self._token())
+
+    def _send(self, code, body, kind="application/json; charset=utf-8", extra=None):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(data)))
+        for key, value in dict(SECURITY, **{"Cache-Control": "no-store", **(extra or {})}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def _gzip(self):
+        return "gzip" in self.headers.get("Accept-Encoding", "").lower()
+
+    def _json(self, code, value, extra=None):
+        data = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        # What a reader asks for (the lists, a terminal's output) is long and repeats itself; what it sends is short.
+        if self.command == "GET" and len(data) > 2048 and self._gzip():
+            data, extra = gzip.compress(data, 3, mtime=0), dict(extra or {}, **{"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
+        self._send(code, data, extra=extra)
+
+    def _error(self, exc, fallback):
+        self._json(400, {"error": str(exc) if isinstance(exc, relay.RemoteError) else fallback})
+
+    def _static(self, path, mark=""):
+        root = self.server.web
+        name = "index.html" if path in ("", "/") else path.lstrip("/")
+        if name.endswith("/"):
+            name += "index.html"
+        full = os.path.normpath(os.path.join(root, *name.split("/")))
+        kind = TYPES.get(os.path.splitext(full)[1].lower())
+        if not full.startswith(root + os.sep) or kind is None or not os.path.isfile(full):
+            return self._json(404, {"error": "not found"})
+        _, tag, data, packed = _page(full)
+        if full.lower().endswith(".html"):
+            tag, data, packed = _marked(full, root)
+        # Asked for by the mark of what it holds now, a file is kept for good; otherwise the reader asks each time.
+        kept = "public, max-age=31536000, immutable" if mark and mark == tag[:12] else "no-cache"
+        headers = {"Cache-Control": kept, "Vary": "Accept-Encoding"}
+        if packed and self._gzip():
+            data, tag = packed, tag + "-gz"
+            headers["Content-Encoding"] = "gzip"
+        headers["ETag"] = '"%s"' % tag
+        if headers["ETag"] in self.headers.get("If-None-Match", ""):
+            self.send_response(304)
+            for key, value in dict(SECURITY, **headers).items():
+                self.send_header(key, value)
+            return self.end_headers()
+        self._send(200, data, kind, headers)
+
+    # ---- routes
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        url = urlsplit(self.path)
+        path, query = url.path, parse_qs(url.query)
+        first = lambda key, default="": (query.get(key) or [default])[0]
+        self.space = self.server.space
+        terminals = self.space.relay
+        if not path.startswith("/api/"):
+            return self._static(path, first("v"))
+        if path == "/api/session":
+            return self._json(200, {"signed_in": self._authed(), "version": VERSION})
+        if not self._authed():
+            return self._json(401, {"error": "auth"})
+        if path == "/api/terminal/ws":
+            return self._websocket(first("terminal"), first("after", "0"))
+        if path != "/api/terminal":
+            return self._json(404, {"error": "not found"})
+        try:
+            wait = max(0.0, min(25.0, float(first("wait", "0"))))
+            return self._json(200, terminals.overview(first("terminal"), int(first("after", "0")), wait=wait))
+        except (ValueError, TypeError) as exc:
+            return self._error(exc, "终端参数无效")
+
+    def _websocket(self, terminal, after):
+        origin = urlsplit(self.headers.get("Origin", ""))
+        if origin.scheme not in ("http", "https") or origin.netloc.lower() != self.headers.get("Host", "").lower():
+            return self._json(403, {"error": "origin"})
+        try:
+            if self.command != "GET":
+                raise ValueError
+            key = websocket.accept_key(self.headers)
+            after = int(after)
+            terminals = self.space.relay
+            lines = terminals.stream(terminal, after, seconds=3600)
+            first = next(lines)
+        except (ValueError, StopIteration):
+            return self._json(400, {"error": "WebSocket 参数无效"})
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", key)
+        compression = websocket.deflate(self.headers)
+        if compression:
+            self.send_header("Sec-WebSocket-Extensions", compression[0])
+        self.end_headers()
+        self.close_connection = True
+        self.connection.settimeout(35)
+        channel = websocket.Connection(self.rfile, self.connection, compression)
+        channel.send(dict(first, t="out"))
+
+        def output():
+            last_ping = time.monotonic()
+            try:
+                for item in lines:
+                    if channel.closed.is_set():
+                        return
+                    if not self._authed():
+                        channel.close(1008)
+                        return
+                    channel.send(dict(item, t="out"))
+                    if time.monotonic() - last_ping >= 15:
+                        channel.send(b"", opcode=9)  # browsers answer pong even when the user is idle
+                        last_ping = time.monotonic()
+                channel.close(1001)
+            except (OSError, ValueError):
+                channel.close(1011)
+            finally:
+                channel.closed.set()
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        threading.Thread(target=output, daemon=True).start()
+        try:
+            while not channel.closed.is_set():
+                raw = channel.receive()
+                if not self._authed():
+                    channel.close(1008)
+                    break
+                payload = json.loads(raw)
+                if not isinstance(payload, dict) or payload.get("terminal") != terminal or payload.get("action") not in ("input", "resize", "close", "rename"):
+                    raise relay.RemoteError("终端操作无效")
+                try:
+                    result = terminals.command(payload)
+                    channel.send(dict(result, t="ack", status=200))
+                except relay.RemoteError as error:
+                    channel.send({"t": "ack", "id": payload.get("id"), "status": 400, "state": "error", "error": str(error)})
+                except OSError:
+                    channel.send({"t": "ack", "id": payload.get("id"), "status": 500, "error": "终端记录保存失败"})
+        except websocket.ProtocolError as error:
+            channel.close(error.code)
+        except (ValueError, TypeError):
+            channel.close(1007)
+        except OSError:
+            pass
+        finally:
+            channel.closed.set()
+
+    def do_POST(self):
+        path = urlsplit(self.path).path
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > BODY_LIMIT:
+            self.close_connection = True
+            return self._json(413, {"error": "请求过大"})
+        raw = self.rfile.read(length)
+        # A page on another site cannot send JSON with our cookie: the content type forces a preflight that is
+        # never answered, and a browser's Origin must be this server.
+        origin = self.headers.get("Origin")
+        if not self.headers.get("Content-Type", "").lower().startswith("application/json") or (
+                origin and urlsplit(origin).netloc.lower() != (self.headers.get("Host") or "").lower()):
+            return self._json(403, {"error": "origin"})
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+            if not isinstance(payload, dict):
+                raise ValueError
+        except (ValueError, UnicodeDecodeError):
+            return self._json(400, {"error": "请求格式无效"})
+        space = self.space = self.server.space
+        terminals = space.relay
+        if path == "/api/login":
+            address, attempts = self._address(), space.attempts
+            if attempts.blocked(address):
+                return self._json(429, {"error": "密码错误次数过多，请 15 分钟后再试"})
+            given = payload.get("password")
+            if "ticket" in payload:
+                accepted = space.tickets.take(payload.get("ticket"))
+            else:
+                accepted = space.accepts(given)
+            if not accepted:
+                attempts.fail(address)
+                time.sleep(0.4)
+                return self._json(401, {"error": "密码不正确"})
+            attempts.clear(address)
+            token = space.sessions.create()
+            cookie = "rcli=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Strict" % (token, SESSION_DAYS * 86400)
+            return self._json(200, {"ok": True, "token": token}, {"Set-Cookie": cookie})
+        if path == "/api/logout":
+            space.sessions.remove(self._token())
+            return self._json(200, {"ok": True}, {"Set-Cookie": "rcli=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"})
+        if not self._authed():
+            return self._json(401, {"error": "auth"})
+        if path == "/api/ticket":
+            return self._json(200, {"ticket": space.tickets.make()})
+        call = {"/api/terminal": terminals.command, "/api/terminal/agent": terminals.agent, "/api/terminal/agent/pull": terminals.pull, "/api/files": terminals.files,
+                "/api/conversation": terminals.conversation, "/api/computer": terminals.computer}.get(path)
+        if call is None:
+            return self._json(404, {"error": "not found"})
+        try:
+            return self._json(200, call(payload))
+        except (ValueError, TypeError) as exc:
+            return self._error(exc, "请求格式无效")
+        except OSError:
+            return self._json(500, {"error": "终端记录保存失败"})
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 64
+
+
+def make_server(host, port, data, web, password=None):
+    """One computer's relay with one password."""
+    os.makedirs(data, exist_ok=True)
+    server = Server((host, port), Handler)
+    server.web = os.path.abspath(web)
+    made = False
+    if password is None:
+        password, made = read_password(data)
+    server.password, server.password_made = password, made
+    space = server.space = Space(data, password)
+    server.sessions, server.attempts, server.tickets, server.store = space.sessions, space.attempts, space.tickets, space.store
+    return server
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    parser = argparse.ArgumentParser(description="remote-cli relay")
+    parser.add_argument("--host", default="127.0.0.1", help="address to listen on: the computer's Tailscale address")
+    parser.add_argument("--port", type=int, default=8722)
+    parser.add_argument("--data", default=os.path.join(here, "data"), help="folder for the password, sign-ins and terminal state")
+    parser.add_argument("--web", default=os.path.join(os.path.dirname(here), "web"), help="folder of the web client")
+    args = parser.parse_args()
+    server = make_server(args.host, args.port, args.data, args.web)
+    if len(server.password) < 12:
+        print("warning: the password is shorter than 12 characters", file=sys.stderr)
+    print("remote-cli relay %s on http://%s:%d" % (VERSION, args.host, args.port), flush=True)
+    if server.password_made:
+        print("password (also saved in %s): %s" % (os.path.join(args.data, "password.txt"), server.password), flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

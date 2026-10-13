@@ -1,0 +1,58 @@
+[
+  {
+    "name": "@highlightjs/cdn-assets",
+    "version": "11.10.0",
+    "source": "npm",
+    "integrity": "sha512-vWXpu+Rdm0YMJmugFdUiL/9DmgYjEiV+d5DBqlXdApnGPSIeo6+LRS5Hpx6fvVsKkvR4RsLYD9rQ6DOLkj7OKA==",
+    "license": "BSD-3-Clause"
+  },
+  {
+    "name": "marked",
+    "version": "12.0.2",
+    "source": "npm",
+    "integrity": "sha512-qXUm7e/YKFoqFPYPa3Ukg9xlI5cyAtGmyEIzMfW//m6kXwCy2Ps9DYf5ioijFKQ8qyuscrHoY04iJGctu2Kg0Q==",
+    "license": "MIT"
+  },
+  {
+    "name": "dompurify",
+    "version": "3.1.6",
+    "source": "npm",
+    "integrity": "sha512-cTOAhc36AalkjtBpfG6O8JimdTMWNXjiePT2xQH/ppBGi/4uIpmj8eKyIkMJErXWARyINV/sB38yf8JCLF5pbQ==",
+    "license": "MPL-2.0 OR Apache-2.0"
+  },
+  {
+    "name": "xlsx",
+    "version": "0.20.3",
+    "source": "SheetJS CDN",
+    "integrity": "sha512-oLDq3jw7AcLqKWH2AhCpVTZl8mf6X2YReP+Neh0SJUzV/BdZYjth94tG5toiMB1PPrYtxOCfaoUCkvtuH+3AJA==",
+    "license": "Apache-2.0"
+  },
+  {
+    "name": "pdfjs-dist",
+    "version": "3.11.174",
+    "source": "npm",
+    "integrity": "sha512-TdTZPf1trZ8/UFu5Cx/GXB7GZM30LT+wWUNfsi6Bq8ePLnb+woNKtDymI2mxZYBpMbonNFqKmiz684DIfnd8dA==",
+    "license": "Apache-2.0"
+  },
+  {
+    "name": "docx-preview",
+    "version": "0.4.1",
+    "source": "npm",
+    "integrity": "sha512-Dv4g+LeE0swHpPvNC0lAT0YsR5Zq5pAxw7d3vHQ8EChBLgIrqqe9VPL5nVt2HBJap8bEZbXUI0TJob7kBeNU9w==",
+    "license": "Apache-2.0"
+  },
+  {
+    "name": "jszip",
+    "version": "3.10.2",
+    "source": "npm",
+    "integrity": "sha512-3l+rb15IOWtUhU0H5MFqES/T6Kh7abYwjosBey/vD6hDt8zoEffkSC5Ws5SGtgVw3gBx2NEbhTeSW1+kWkpyTQ==",
+    "license": "MIT OR GPL-3.0-or-later"
+  },
+  {
+    "name": "pptx-preview",
+    "version": "1.0.7",
+    "source": "npm",
+    "integrity": "sha512-YByocJuyxAR4YB4Q3+VAxdLfEvA5LojG1gAJsx2Mw0QU5FJPps/2fkJOupJ6oBbA+KdWRpuAk6G6T34rKCHVxw==",
+    "license": "ISC"
+  }
+]
